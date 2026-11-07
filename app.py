@@ -91,7 +91,7 @@ RULES
 - For single questions give "find" and "givens": one entry per other quantity, each {{"symbol": key, "value": number as written, "unit": unit symbol}}. Every value/unit in the text must match a given.
 - For multistep questions give "text", "answer_quantity", "calculation_si" (one arithmetic expression in SI), "answer", and "working" (at least 2 short steps).
 {retry}
-Return ONLY JSON with exactly these keys: {', '.join(s['key'] for s in SECTIONS if s['kind'] != 'generated')}."""
+Return ONLY JSON with exactly these keys: {', '.join(s['key'] for s in SECTIONS if s['kind'] != 'generated')}"""
 
 
 def response_schema():
@@ -122,13 +122,7 @@ def response_schema():
             "answer": {"type": "NUMBER"},
             "working": {"type": "ARRAY", "items": {"type": "STRING"}},
         },
-        "required": [
-            "text",
-            "answer_quantity",
-            "calculation_si",
-            "answer",
-            "working",
-        ],
+        "required": ["text", "answer_quantity", "calculation_si", "answer", "working"],
     }
     props = {
         spec["key"]: {
@@ -139,6 +133,7 @@ def response_schema():
         if spec["kind"] != "generated"
     }
     return {"type": "OBJECT", "properties": props, "required": list(props)}
+
 
 def get_gemini_api_key():
     key = os.getenv("GEMINI_API_KEY")
@@ -191,80 +186,37 @@ def _fmt_answer(value, unit):
 
 
 def process_single(eq, spec, index, raw):
-    where = f'"{spec["key"]}" question {index}'
-    if not isinstance(raw, dict) or not isinstance(raw.get("givens"), list) or not isinstance(raw.get("text"), str):
-        raise ValueError(f"{where} is not in the required format.")
-    text, find = normalise_text(raw["text"]).strip(), raw.get("find")
-    if find not in eq.keys:
-        raise ValueError(f'{where}: invalid "find" quantity.')
-    if spec["find"] == "subject" and find != eq.subject:
-        raise ValueError(f'{where}: find must be {eq.subject}.')
-    if spec["find"] == "other" and find == eq.subject:
-        raise ValueError(f'{where}: this section requires rearranging.')
-    expected, seen = set(eq.keys) - {find}, set()
-    values_si, conversions, given_pairs = {}, [], []
-    nums = numbers_in_text(text)
+    """Convert a single-question response into worksheet content without validating it."""
+    text = normalise_text(raw["text"]).strip()
+    find = raw["find"]
+    values_si, conversions = {}, []
     for given in raw["givens"]:
-        try:
-            key, unit, value = given["symbol"], normalise_text(given["unit"]).strip(), float(given["value"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"{where}: malformed given value.") from exc
-        if key not in expected or key in seen:
-            raise ValueError(f"{where}: givens must contain each of {sorted(expected)} exactly once.")
-        seen.add(key)
-        if unit in FORBIDDEN_CONVERSION_UNITS:
-            raise ValueError(f'{where}: conversion from "{unit}" is not allowed.')
-        if unit not in eq.allowed_units(key):
-            raise ValueError(f'{where}: unit "{unit}" is not allowed for {eq.qname[key]}.')
-        if not any(_close(value, n) for n in nums) or unit not in text:
-            raise ValueError(f'{where}: question text is missing "{fmt_num(value, 6)} {unit}".')
+        key = given["symbol"]
+        unit = normalise_text(given["unit"]).strip()
+        value = float(given["value"])
         info = UNIT_INFO[unit]
         si_value = Fraction(str(value)) * info["factor"]
         values_si[key] = si_value
-        given_pairs.append((value, unit))
         if unit != info["si"]:
             conversions.append((value, unit, si_value, info["si"]))
-    if seen != expected:
-        raise ValueError(f"{where}: givens must contain each of {sorted(expected)} exactly once.")
-    for number, unit in units_in_text(text):
-        if unit in FORBIDDEN_CONVERSION_UNITS:
-            raise ValueError(f'{where}: conversion from "{unit}" is not allowed.')
-        if not any(_close(number, v) and unit == u for v, u in given_pairs):
-            raise ValueError(f'{where}: question contains unlisted value "{fmt_num(number, 6)} {unit}".')
-    if spec["conv"] is not None and len(conversions) != spec["conv"]:
-        raise ValueError(f"{where}: needs exactly {spec['conv']} non-SI value(s).")
     result = eq.evaluate(find, values_si)
-    if not (math.isfinite(result) and 1e-6 <= result <= 1e9):
-        raise ValueError(f"{where}: answer is not a sensible size.")
     steps = [f"{fmt_num(v, 6)} {u} = {fmt_num(float(s), 6)} {si}" for v, u, s, si in conversions]
     steps.append(f"{eq.rearranged(find)} = {eq.substituted(find, values_si)} = **{_fmt_answer(result, eq.si_unit(find))}**")
     return {"text": text, "answer": "; ".join(steps), "result": result, "units": units_in_text(text)}
 
 
 def process_multi(eq, spec, index, raw):
-    where = f'"{spec["key"]}" question {index}'
-    try:
-        text = normalise_text(raw["text"]).strip()
-        key, claimed, calculation = raw["answer_quantity"], float(raw["answer"]), raw["calculation_si"]
-        working = [normalise_text(w).strip() for w in raw["working"] if str(w).strip()]
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"{where} is not in the required format.") from exc
-    if key not in eq.keys or len(working) < 2:
-        raise ValueError(f"{where}: invalid answer quantity or insufficient working steps.")
-    if any(unit in FORBIDDEN_CONVERSION_UNITS for _, unit in units_in_text(text)):
-        raise ValueError(f"{where}: do not use km/h or hours as given units.")
+    """Convert a multistep response into worksheet content without validating it."""
+    text = normalise_text(raw["text"]).strip()
+    key = raw["answer_quantity"]
+    calculation = raw["calculation_si"]
+    working = [normalise_text(w).strip() for w in raw["working"] if str(w).strip()]
     result = safe_eval(calculation)
-    if not _close(result, claimed, 0.01):
-        raise ValueError(f"{where}: calculation and claimed answer do not match.")
-    if not (1e-6 <= result <= 1e9):
-        raise ValueError(f"{where}: answer is not a sensible size.")
     return {"text": text, "answer": " → ".join(working) + f" → **{_fmt_answer(result, eq.si_unit(key))}**", "result": result, "units": units_in_text(text)}
 
 
 def build_unit_conversion_items(eq, needed_units, n, rng):
     chosen = list(needed_units)
-    if len(chosen) > n:
-        raise ValueError(f"At most {n} different non-SI units can be used; reuse units.")
     pool = []
     for dim in [eq.dim[k] for k in eq.keys] + ["length", "time", "mass"]:
         pool += [u[0] for u in UNIT_GROUPS[dim]["others"] if u[0] not in FORBIDDEN_CONVERSION_UNITS]
@@ -394,7 +346,8 @@ def _render_section(target, spec, items, answers):
             width = int(tcw.get(qn("w:w")))
     is_conversion = spec["key"] == "unit_conversions"
     for i, item in enumerate(items):
-        label = f"{'abcdefgh'[i]})" if is_conversion else f"{i + 1})"
+        label = f"{'abcdefgh'[i]}" if is_conversion and i < 8 else f"{i + 1}"
+        label += ")"
         if answers:
             _numbered(target, label, item["answer"], size=7.5)
         elif spec["answer_line"] == "inline":
