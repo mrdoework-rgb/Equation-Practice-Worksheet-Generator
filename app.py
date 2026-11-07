@@ -95,43 +95,10 @@ Return ONLY JSON with exactly these keys: {', '.join(s['key'] for s in SECTIONS 
 
 
 def response_schema():
-    given = {
-        "type": "OBJECT",
-        "properties": {
-            "symbol": {"type": "STRING"},
-            "value": {"type": "NUMBER"},
-            "unit": {"type": "STRING"},
-        },
-        "required": ["symbol", "value", "unit"],
-    }
-    single = {
-        "type": "OBJECT",
-        "properties": {
-            "text": {"type": "STRING"},
-            "find": {"type": "STRING"},
-            "givens": {"type": "ARRAY", "items": given},
-        },
-        "required": ["text", "find", "givens"],
-    }
-    multi = {
-        "type": "OBJECT",
-        "properties": {
-            "text": {"type": "STRING"},
-            "answer_quantity": {"type": "STRING"},
-            "calculation_si": {"type": "STRING"},
-            "answer": {"type": "NUMBER"},
-            "working": {"type": "ARRAY", "items": {"type": "STRING"}},
-        },
-        "required": ["text", "answer_quantity", "calculation_si", "answer", "working"],
-    }
-    props = {
-        spec["key"]: {
-            "type": "ARRAY",
-            "items": multi if spec["kind"] == "multi" else single,
-        }
-        for spec in SECTIONS
-        if spec["kind"] != "generated"
-    }
+    given = {"type": "OBJECT", "properties": {"symbol": {"type": "STRING"}, "value": {"type": "NUMBER"}, "unit": {"type": "STRING"}}, "required": ["symbol", "value", "unit"]}
+    single = {"type": "OBJECT", "properties": {"text": {"type": "STRING"}, "find": {"type": "STRING"}, "givens": {"type": "ARRAY", "items": given}}, "required": ["text", "find", "givens"]}
+    multi = {"type": "OBJECT", "properties": {"text": {"type": "STRING"}, "answer_quantity": {"type": "STRING"}, "calculation_si": {"type": "STRING"}, "answer": {"type": "NUMBER"}, "working": {"type": "ARRAY", "items": {"type": "STRING"}}}, "required": ["text", "answer_quantity", "calculation_si", "answer", "working"]}
+    props = {spec["key"]: {"type": "ARRAY", "items": multi if spec["kind"] == "multi" else single} for spec in SECTIONS if spec["kind"] != "generated"}
     return {"type": "OBJECT", "properties": props, "required": list(props)}
 
 
@@ -156,10 +123,8 @@ def clean_json_text(text):
 def call_gemini(prompt, api_key):
     model = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
-               "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json", "responseSchema": response_schema()}}
-    request = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST",
-                                     headers={"Content-Type": "application/json", "x-goog-api-key": api_key})
+    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json", "responseSchema": response_schema()}}
+    request = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST", headers={"Content-Type": "application/json", "x-goog-api-key": api_key})
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
             response_data = json.loads(response.read().decode("utf-8"))
@@ -186,7 +151,6 @@ def _fmt_answer(value, unit):
 
 
 def process_single(eq, spec, index, raw):
-    """Convert a single-question response into worksheet content without validating it."""
     text = normalise_text(raw["text"]).strip()
     find = raw["find"]
     values_si, conversions = {}, []
@@ -200,18 +164,21 @@ def process_single(eq, spec, index, raw):
         if unit != info["si"]:
             conversions.append((value, unit, si_value, info["si"]))
     result = eq.evaluate(find, values_si)
+    if not math.isfinite(result):
+        raise ValueError("answer is not finite")
     steps = [f"{fmt_num(v, 6)} {u} = {fmt_num(float(s), 6)} {si}" for v, u, s, si in conversions]
     steps.append(f"{eq.rearranged(find)} = {eq.substituted(find, values_si)} = **{_fmt_answer(result, eq.si_unit(find))}**")
     return {"text": text, "answer": "; ".join(steps), "result": result, "units": units_in_text(text)}
 
 
 def process_multi(eq, spec, index, raw):
-    """Convert a multistep response into worksheet content without validating it."""
     text = normalise_text(raw["text"]).strip()
     key = raw["answer_quantity"]
     calculation = raw["calculation_si"]
     working = [normalise_text(w).strip() for w in raw["working"] if str(w).strip()]
     result = safe_eval(calculation)
+    if not math.isfinite(result) or not working:
+        raise ValueError("invalid answer or working")
     return {"text": text, "answer": " → ".join(working) + f" → **{_fmt_answer(result, eq.si_unit(key))}**", "result": result, "units": units_in_text(text)}
 
 
@@ -251,32 +218,45 @@ def build_basics(eq):
 def build_model(eq, data, seed=None):
     if not isinstance(data, dict):
         raise ValueError("Gemini JSON must be an object.")
-    sections, needed = {}, []
+    sections, needed, warnings = {}, [], []
     for spec in SECTIONS:
         if spec["kind"] == "generated":
             continue
         raw_items = data.get(spec["key"])
-        if not isinstance(raw_items, list) or len(raw_items) != spec["n"]:
-            raise ValueError(f'"{spec["key"]}" must contain exactly {spec["n"]} questions.')
+        if not isinstance(raw_items, list):
+            warnings.append(f'{spec["heading"]}: section data was missing or malformed; no questions included.')
+            sections[spec["key"]] = []
+            continue
         process = process_multi if spec["kind"] == "multi" else process_single
-        items = [process(eq, spec, i + 1, raw) for i, raw in enumerate(raw_items)]
-        if len({item["text"].lower() for item in items}) != len(items):
-            raise ValueError(f'"{spec["key"]}" has duplicate questions.')
-        for item in items:
+        items, seen_texts = [], set()
+        for index, raw in enumerate(raw_items, start=1):
+            try:
+                item = process(eq, spec, index, raw)
+                if not item["text"]:
+                    raise ValueError("question text is empty")
+                normalized_question = item["text"].lower()
+                if normalized_question in seen_texts:
+                    raise ValueError("duplicate question")
+                seen_texts.add(normalized_question)
+            except Exception as exc:
+                # A malformed response should only discard this item, not the whole sheet.
+                warnings.append(f'{spec["heading"]} question {index} skipped: {exc}')
+                continue
+            items.append(item)
             for _, unit in item["units"]:
                 if unit != UNIT_INFO[unit]["si"] and unit not in needed:
                     needed.append(unit)
+        if len(items) < spec["n"]:
+            warnings.append(f'{spec["heading"]}: included {len(items)} of {spec["n"]} questions.')
         sections[spec["key"]] = items
     sections["unit_conversions"] = build_unit_conversion_items(eq, needed, SPEC["unit_conversions"]["n"], random.Random(seed if seed is not None else eq.name))
-    return {"equation": eq, "sections": sections, "basics": build_basics(eq)}
+    return {"equation": eq, "sections": sections, "basics": build_basics(eq), "warnings": warnings}
 
 
 def generate_content(eq, api_key, year_group="", ability="", notes="", on_response=None):
     error = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         data = call_gemini(build_prompt(eq, year_group, ability, notes, error), api_key)
-        # Show the raw response before parsing it into the worksheet model. This keeps
-        # the diagnostic JSON visible even when model-building raises an error.
         if on_response is not None:
             on_response(data, attempt)
         try:
@@ -389,7 +369,6 @@ def generate_documents(model, template_path):
     for mode in ("worksheet", "answers"):
         answers = mode == "answers"
         doc = Document(str(template_path))
-        # Force portrait A4 and narrow margins to make the worksheet compact on one side.
         for section in doc.sections:
             section.page_width, section.page_height = Cm(21), Cm(29.7)
             section.top_margin = section.bottom_margin = Cm(0.65)
@@ -480,7 +459,7 @@ def main():
                 with st.spinner("Generating questions and checking answers..."):
                     model, raw = generate_content(eq, api_key, year_group, ability, notes, on_response=show_response)
                 result = generate_documents(model, prepare_template_path(uploaded_template))
-                st.session_state.update(fw_worksheet=result["worksheet"].getvalue(), fw_answers=result["answers"].getvalue(), fw_name=eq.name, fw_warnings=result["warnings"])
+                st.session_state.update(fw_worksheet=result["worksheet"].getvalue(), fw_answers=result["answers"].getvalue(), fw_name=eq.name, fw_warnings=result["warnings"] + model.get("warnings", []))
                 st.success("Worksheet generated successfully!")
             except Exception as exc:
                 st.error(f"❌ An error occurred: {exc}")
