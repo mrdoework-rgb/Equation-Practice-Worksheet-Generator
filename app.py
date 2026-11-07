@@ -95,12 +95,50 @@ Return ONLY JSON with exactly these keys: {', '.join(s['key'] for s in SECTIONS 
 
 
 def response_schema():
-    given = {"type": "OBJECT", "properties": {"symbol": {"type": "STRING"}, "value": {"type": "NUMBER"}, "unit": {"type": "STRING"}}, "required": ["symbol", "value", "unit"]}
-    single = {"type": "OBJECT", "properties": {"text": {"type": "STRING"}, "find": {"type": "STRING"}, "givens": {"type": "ARRAY", "items": given}, "required": ["text", "find", "givens"]}
-    multi = {"type": "OBJECT", "properties": {"text": {"type": "STRING"}, "answer_quantity": {"type": "STRING"}, "calculation_si": {"type": "STRING"}, "answer": {"type": "NUMBER"}, "working": {"type": "ARRAY", "items": {"type": "STRING"}}, "required": ["text", "answer_quantity", "calculation_si", "answer", "working"]}
-    props = {s["key"]: {"type": "ARRAY", "items": multi if s["kind"] == "multi" else single} for s in SECTIONS if s["kind"] != "generated"}
+    given = {
+        "type": "OBJECT",
+        "properties": {
+            "symbol": {"type": "STRING"},
+            "value": {"type": "NUMBER"},
+            "unit": {"type": "STRING"},
+        },
+        "required": ["symbol", "value", "unit"],
+    }
+    single = {
+        "type": "OBJECT",
+        "properties": {
+            "text": {"type": "STRING"},
+            "find": {"type": "STRING"},
+            "givens": {"type": "ARRAY", "items": given},
+        },
+        "required": ["text", "find", "givens"],
+    }
+    multi = {
+        "type": "OBJECT",
+        "properties": {
+            "text": {"type": "STRING"},
+            "answer_quantity": {"type": "STRING"},
+            "calculation_si": {"type": "STRING"},
+            "answer": {"type": "NUMBER"},
+            "working": {"type": "ARRAY", "items": {"type": "STRING"}},
+        },
+        "required": [
+            "text",
+            "answer_quantity",
+            "calculation_si",
+            "answer",
+            "working",
+        ],
+    }
+    props = {
+        spec["key"]: {
+            "type": "ARRAY",
+            "items": multi if spec["kind"] == "multi" else single,
+        }
+        for spec in SECTIONS
+        if spec["kind"] != "generated"
+    }
     return {"type": "OBJECT", "properties": props, "required": list(props)}
-
 
 def get_gemini_api_key():
     key = os.getenv("GEMINI_API_KEY")
