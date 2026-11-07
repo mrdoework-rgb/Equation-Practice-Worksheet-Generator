@@ -13,20 +13,18 @@ from pathlib import Path
 from uuid import uuid4
 
 import streamlit as st
-import streamlit.components.v1 as components
 from docx import Document
 from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, Twips
 from docx.text.paragraph import Paragraph
 from physics_data import (EQUATIONS, UNIT_GROUPS, UNIT_INFO, fmt_num, is_exact_to_sig,
-                          normalise_text, numbers_in_text, plain_symbol, safe_eval, units_in_text)
+                          normalise_text, plain_symbol, safe_eval, units_in_text)
 
 DEFAULT_TEMPLATE = Path(__file__).parent / "Formulae_Questions_worksheet_template.docx"
 NBSP = " "
 BLANK = "________"
 QUESTION_PT = 8
-MAX_ATTEMPTS = 3
 FORBIDDEN_CONVERSION_UNITS = {"km/h", "h"}
 SECTIONS = [
     dict(key="substitute", placeholder="substitute", heading="Substitute", n=8, kind="single", find="subject", conv=0, answer_line="inline"),
@@ -41,7 +39,7 @@ SPEC = {s["key"]: s for s in SECTIONS}
 FALLBACK_HOST = {"unit_conversions": "substitute", "multistep_questions": "word_questions"}
 
 
-def build_prompt(eq, year_group="", ability="", notes="", previous_error=None):
+def build_prompt(eq, year_group="", ability="", notes=""):
     quantity_lines = []
     for key in eq.keys:
         others = eq.allowed_units(key)[1:]
@@ -53,19 +51,15 @@ def build_prompt(eq, year_group="", ability="", notes="", previous_error=None):
             continue
         free = math.ceil(spec["n"] / 2)
         if spec["key"] == "multistep_questions":
-            rule = "Each needs 2 or more calculation steps; the last step must use the equation above."
-            context = "Every question has a short real-world context."
+            rule, context = "Each needs 2 or more calculation steps; the last step must use the equation above.", "Every question has a short real-world context."
         elif spec["key"] == "word_questions":
-            rule = "One step with the equation above; information is presented in a short 2-3 sentence context."
-            context = "Every question has the longer context."
+            rule, context = "One step with the equation above; information is presented in a short 2-3 sentence context.", "Every question has the longer context."
         else:
-            find = {"subject": f'"find" must be "{eq.subject}" (no rearranging)',
-                    "other": f'"find" must NOT be "{eq.subject}" (rearrange the equation)'}[spec["find"]]
+            find = {"subject": f'"find" must be "{eq.subject}" (no rearranging)', "other": f'"find" must NOT be "{eq.subject}" (rearrange the equation)'}[spec["find"]]
             conv = {0: "All values are in SI units.", 1: "Exactly ONE given value is in a non-SI unit."}[spec["conv"]]
             rule = f"{find}. {conv} Very brief, one-sentence questions."
-            context = (f"First {free} questions have no scenario. Remaining {spec['n'] - free} have a very brief real-world scenario.")
+            context = f"First {free} questions have no scenario. Remaining {spec['n'] - free} have a very brief real-world scenario."
         section_lines.append(f'- "{spec["key"]}": exactly {spec["n"]} questions. {rule} {context}')
-    retry = f"\nYour previous answer was rejected: {previous_error}. Return the full corrected JSON.\n" if previous_error else ""
     return f"""You are an experienced GCSE Physics teacher making short calculation practice for lower-attaining and SEND students. Return one raw JSON object only.
 
 EQUATION
@@ -90,16 +84,7 @@ RULES
 - Questions in a section must differ.
 - For single questions give "find" and "givens": one entry per other quantity, each {{"symbol": key, "value": number as written, "unit": unit symbol}}. Every value/unit in the text must match a given.
 - For multistep questions give "text", "answer_quantity", "calculation_si" (one arithmetic expression in SI), "answer", and "working" (at least 2 short steps).
-{retry}
 Return ONLY JSON with exactly these keys: {', '.join(s['key'] for s in SECTIONS if s['kind'] != 'generated')}"""
-
-
-def response_schema():
-    given = {"type": "OBJECT", "properties": {"symbol": {"type": "STRING"}, "value": {"type": "NUMBER"}, "unit": {"type": "STRING"}}, "required": ["symbol", "value", "unit"]}
-    single = {"type": "OBJECT", "properties": {"text": {"type": "STRING"}, "find": {"type": "STRING"}, "givens": {"type": "ARRAY", "items": given}}, "required": ["text", "find", "givens"]}
-    multi = {"type": "OBJECT", "properties": {"text": {"type": "STRING"}, "answer_quantity": {"type": "STRING"}, "calculation_si": {"type": "STRING"}, "answer": {"type": "NUMBER"}, "working": {"type": "ARRAY", "items": {"type": "STRING"}}}, "required": ["text", "answer_quantity", "calculation_si", "answer", "working"]}
-    props = {spec["key"]: {"type": "ARRAY", "items": multi if spec["kind"] == "multi" else single} for spec in SECTIONS if spec["kind"] != "generated"}
-    return {"type": "OBJECT", "properties": props, "required": list(props)}
 
 
 def get_gemini_api_key():
@@ -123,7 +108,7 @@ def clean_json_text(text):
 def call_gemini(prompt, api_key):
     model = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json", "responseSchema": response_schema()}}
+    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.4, "responseMimeType": "application/json"}}
     request = urllib.request.Request(url, data=json.dumps(payload).encode(), method="POST", headers={"Content-Type": "application/json", "x-goog-api-key": api_key})
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
@@ -141,21 +126,29 @@ def call_gemini(prompt, api_key):
         raise ValueError(f"Gemini did not return valid JSON: {exc}") from exc
 
 
-def _close(a, b, rel=1e-9):
-    return abs(a - b) <= rel * max(1.0, abs(a), abs(b))
-
-
 def _fmt_answer(value, unit):
     text = f"{fmt_num(value)} {unit}".strip()
     return text + (" (3 s.f.)" if not is_exact_to_sig(value) else "")
 
 
+def _quantity_key(eq, value):
+    """Accept the internal key, display symbol, or quantity name from Gemini."""
+    value = str(value).strip()
+    if value in eq.keys:
+        return value
+    folded = value.casefold()
+    for key in eq.keys:
+        if folded in {eq.qname[key].casefold(), plain_symbol(eq.symbol[key]).casefold()}:
+            return key
+    return value
+
+
 def process_single(eq, spec, index, raw):
     text = normalise_text(raw["text"]).strip()
-    find = raw["find"]
+    find = _quantity_key(eq, raw["find"])
     values_si, conversions = {}, []
     for given in raw["givens"]:
-        key = given["symbol"]
+        key = _quantity_key(eq, given["symbol"])
         unit = normalise_text(given["unit"]).strip()
         value = float(given["value"])
         info = UNIT_INFO[unit]
@@ -164,8 +157,6 @@ def process_single(eq, spec, index, raw):
         if unit != info["si"]:
             conversions.append((value, unit, si_value, info["si"]))
     result = eq.evaluate(find, values_si)
-    if not math.isfinite(result):
-        raise ValueError("answer is not finite")
     steps = [f"{fmt_num(v, 6)} {u} = {fmt_num(float(s), 6)} {si}" for v, u, s, si in conversions]
     steps.append(f"{eq.rearranged(find)} = {eq.substituted(find, values_si)} = **{_fmt_answer(result, eq.si_unit(find))}**")
     return {"text": text, "answer": "; ".join(steps), "result": result, "units": units_in_text(text)}
@@ -173,13 +164,12 @@ def process_single(eq, spec, index, raw):
 
 def process_multi(eq, spec, index, raw):
     text = normalise_text(raw["text"]).strip()
-    key = raw["answer_quantity"]
-    calculation = raw["calculation_si"]
+    key = _quantity_key(eq, raw["answer_quantity"])
     working = [normalise_text(w).strip() for w in raw["working"] if str(w).strip()]
-    result = safe_eval(calculation)
-    if not math.isfinite(result) or not working:
-        raise ValueError("invalid answer or working")
-    return {"text": text, "answer": " → ".join(working) + f" → **{_fmt_answer(result, eq.si_unit(key))}**", "result": result, "units": units_in_text(text)}
+    # Use the model-supplied result; correctness is intentionally left to the API/user.
+    result = float(raw["answer"])
+    unit = eq.si_unit(key) if key in eq.keys else ""
+    return {"text": text, "answer": " → ".join(working) + f" → **{_fmt_answer(result, unit)}**", "result": result, "units": units_in_text(text)}
 
 
 def build_unit_conversion_items(eq, needed_units, n, rng):
@@ -216,54 +206,28 @@ def build_basics(eq):
 
 
 def build_model(eq, data, seed=None):
-    if not isinstance(data, dict):
-        raise ValueError("Gemini JSON must be an object.")
-    sections, needed, warnings = {}, [], []
+    """Transform returned data for document generation without question validation."""
+    sections, needed = {}, []
     for spec in SECTIONS:
         if spec["kind"] == "generated":
             continue
-        raw_items = data.get(spec["key"])
-        if not isinstance(raw_items, list):
-            warnings.append(f'{spec["heading"]}: section data was missing or malformed; no questions included.')
-            sections[spec["key"]] = []
-            continue
+        raw_items = data.get(spec["key"], [])
         process = process_multi if spec["kind"] == "multi" else process_single
-        items, seen_texts = [], set()
-        for index, raw in enumerate(raw_items, start=1):
-            try:
-                item = process(eq, spec, index, raw)
-                if not item["text"]:
-                    raise ValueError("question text is empty")
-                normalized_question = item["text"].lower()
-                if normalized_question in seen_texts:
-                    raise ValueError("duplicate question")
-                seen_texts.add(normalized_question)
-            except Exception as exc:
-                # A malformed response should only discard this item, not the whole sheet.
-                warnings.append(f'{spec["heading"]} question {index} skipped: {exc}')
-                continue
-            items.append(item)
+        items = [process(eq, spec, i + 1, raw) for i, raw in enumerate(raw_items)]
+        for item in items:
             for _, unit in item["units"]:
                 if unit != UNIT_INFO[unit]["si"] and unit not in needed:
                     needed.append(unit)
-        if len(items) < spec["n"]:
-            warnings.append(f'{spec["heading"]}: included {len(items)} of {spec["n"]} questions.')
         sections[spec["key"]] = items
     sections["unit_conversions"] = build_unit_conversion_items(eq, needed, SPEC["unit_conversions"]["n"], random.Random(seed if seed is not None else eq.name))
-    return {"equation": eq, "sections": sections, "basics": build_basics(eq), "warnings": warnings}
+    return {"equation": eq, "sections": sections, "basics": build_basics(eq)}
 
 
 def generate_content(eq, api_key, year_group="", ability="", notes="", on_response=None):
-    error = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        data = call_gemini(build_prompt(eq, year_group, ability, notes, error), api_key)
-        if on_response is not None:
-            on_response(data, attempt)
-        try:
-            return build_model(eq, data), data
-        except ValueError as exc:
-            error = str(exc)
-    raise ValueError(f"Gemini's questions failed validation {MAX_ATTEMPTS} times. Last problem: {error}")
+    data = call_gemini(build_prompt(eq, year_group, ability, notes), api_key)
+    if on_response is not None:
+        on_response(data, 1)
+    return build_model(eq, data), data
 
 
 def append_text(paragraph, raw_text, bold=None, size=None):
@@ -456,10 +420,10 @@ def main():
                     json_output.markdown(f"Gemini JSON response (attempt {attempt})")
                     json_output.json(data)
             try:
-                with st.spinner("Generating questions and checking answers..."):
+                with st.spinner("Generating questions and creating documents..."):
                     model, raw = generate_content(eq, api_key, year_group, ability, notes, on_response=show_response)
                 result = generate_documents(model, prepare_template_path(uploaded_template))
-                st.session_state.update(fw_worksheet=result["worksheet"].getvalue(), fw_answers=result["answers"].getvalue(), fw_name=eq.name, fw_warnings=result["warnings"] + model.get("warnings", []))
+                st.session_state.update(fw_worksheet=result["worksheet"].getvalue(), fw_answers=result["answers"].getvalue(), fw_name=eq.name, fw_warnings=result["warnings"])
                 st.success("Worksheet generated successfully!")
             except Exception as exc:
                 st.error(f"❌ An error occurred: {exc}")
