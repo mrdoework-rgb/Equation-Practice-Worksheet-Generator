@@ -271,10 +271,14 @@ def build_model(eq, data, seed=None):
     return {"equation": eq, "sections": sections, "basics": build_basics(eq)}
 
 
-def generate_content(eq, api_key, year_group="", ability="", notes=""):
+def generate_content(eq, api_key, year_group="", ability="", notes="", on_response=None):
     error = None
-    for _ in range(MAX_ATTEMPTS):
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         data = call_gemini(build_prompt(eq, year_group, ability, notes, error), api_key)
+        # Show the raw response before parsing it into the worksheet model. This keeps
+        # the diagnostic JSON visible even when model-building raises an error.
+        if on_response is not None:
+            on_response(data, attempt)
         try:
             return build_model(eq, data), data
         except ValueError as exc:
@@ -467,10 +471,14 @@ def main():
         if not api_key:
             st.error("Enter a Gemini API key or set GEMINI_API_KEY.")
         else:
+            json_output = st.container() if show_json else None
+            def show_response(data, attempt):
+                if json_output is not None:
+                    json_output.markdown(f"Gemini JSON response (attempt {attempt})")
+                    json_output.json(data)
             try:
                 with st.spinner("Generating questions and checking answers..."):
-                    model, raw = generate_content(eq, api_key, year_group, ability, notes)
-                if show_json: st.json(raw)
+                    model, raw = generate_content(eq, api_key, year_group, ability, notes, on_response=show_response)
                 result = generate_documents(model, prepare_template_path(uploaded_template))
                 st.session_state.update(fw_worksheet=result["worksheet"].getvalue(), fw_answers=result["answers"].getvalue(), fw_name=eq.name, fw_warnings=result["warnings"])
                 st.success("Worksheet generated successfully!")
