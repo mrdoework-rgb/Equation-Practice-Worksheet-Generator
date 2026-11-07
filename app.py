@@ -54,7 +54,7 @@ MAX_ATTEMPTS = 3
 # conv:  how many givens must need a unit conversion (None = any number)
 # placeholder: the [[...]] text in the template (case-insensitive)
 SECTIONS = [
-    dict(key="substitute", placeholder="substitute", heading="Substitute", n=8, kind="single", find="subject", conv=0, answer_line="inline"),
+    dict(key="substitute", placeholder="substitute", heading="Substitute", n=5, kind="single", find="subject", conv=0, answer_line="inline"),
     dict(key="unit_conversions", placeholder="unit conversions", heading="Unit Conversions", n=6, kind="generated", answer_line="inline"),
     dict(key="substitute_unit_conversions", placeholder="substitute unit conversions", heading="Substitute (convert units)", n=5, kind="single", find="subject", conv=1, answer_line="inline"),
     dict(key="rearrange", placeholder="rearrange", heading="Rearrange", n=5, kind="single", find="other", conv=0, answer_line="inline"),
@@ -120,8 +120,8 @@ RULES FOR EVERY QUESTION
 - Use realistic GCSE values and choose numbers so that the answer is positive and exact to at most 3 significant figures.
 - Across the WHOLE worksheet use at most 5 different non-SI units in total (reuse the same ones). A separate unit-conversion section is created by the app, so do not write one.
 - Questions within a section must all be different.
-- For "single" questions ("substitute", "substitute_unit_conversions", "rearrange", "rearrange_unit_conversions", "word_questions") give: "find" (the key of the quantity asked for) and "givens": one entry for EVERY other quantity in the equation, each as {{"symbol": key, "value": number as written in the text, "unit": unit symbol as written in the text}}. Every number with a unit in the text must appear in "givens" and vice versa.
-- For "multistep_questions" give: "text", "answer_quantity" (key of the quantity the final answer is, from the list above), "calculation_si" (ONE arithmetic expression that evaluates to the final answer in SI units, using only numbers, + - * / ** ( ) and sqrt(); convert every value to SI inside the expression), "answer" (the number it evaluates to) and "working" (2-5 short strings, one per step, written for students).
+- For "single" questions ("substitute", "substitute_unit_conversions", "rearrange", "rearrange_unit_conversions", "word_questions") give: "find" (the key of the quantity asked for) and "givens": one entry for EVERY other quantity in the equation, each as {"symbol": key, "value": number as written in the text, "unit": unit symbol as written in the text}. Every number with a unit in the text must appear in "givens" and vice versa.
+- For "multistep_questions" give: "text", "answer_quantity" (key of the quantity the final answer is, from the list above), "calculation_si" (ONE arithmetic expression that evaluates to the final answer in SI units, using only numbers, + - * / ** ( ) and sqrt(); convert every value to SI inside the expression), "answer" (the number it evaluates to), and "working" (2-5 short strings, one per step, written for students).
 {retry}
 Return ONLY the JSON object with exactly these keys: {', '.join(s['key'] for s in SECTIONS if s['kind'] != 'generated')}."""
 
@@ -172,7 +172,7 @@ def call_gemini(prompt, api_key):
     }
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},  # key in a header, not the URL
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
     )
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
@@ -316,10 +316,7 @@ def build_basics(eq):
     a1 = line(f"{letters[i]}){NBSP}{eq.symbol[k]}{NBSP}={NBSP}{eq.qname[k]}" for i, k in enumerate(eq.keys))
     q2 = line(f"{letters[i]}){NBSP}{cap(eq.qname[k]).replace(' ', NBSP)}{NBSP}{BLANK}" for i, k in enumerate(eq.keys))
     a2 = line(f"{letters[i]}){NBSP}{eq.si_unit(k)}" for i, k in enumerate(eq.keys))
-    if eq.triangle:
-        q3 = ("Complete the formula triangle.   ", "", "")
-    else:
-        q3 = ("Write the equation using letters.   ", f"{BLANK}{BLANK}", eq.letters)
+    q3 = ("Write the equation using letters.   ", f"{BLANK}{BLANK}", eq.letters)
     q4 = line(f"{letters[i]}){NBSP}{eq.symbol[k]}{NBSP}={NBSP}{BLANK}" for i, k in enumerate(eq.keys))
     a4 = line(f"{letters[i]}){NBSP}{eq.rearranged(k).replace(' ', NBSP)}" for i, k in enumerate(eq.keys))
     return [
@@ -442,7 +439,7 @@ def _all_paragraphs(doc):
 
 def _placeholder_name(paragraph):
     text = re.sub(r"\s+", " ", paragraph.text.replace(" ", " ")).strip()
-    match = re.fullmatch(r"\[{1,2}\s*(.+?)\s*\]{1,2}", text)   # tolerate a mistyped single bracket
+    match = re.fullmatch(r"\[{1,2}\s*(.+?)\s*\]{1,2}", text)
     return match.group(1).lower() if match else None
 
 
@@ -509,35 +506,52 @@ def _render_section(target, spec, items, answers):
     return spacer
 
 
+def _remove_page_break(paragraph):
+    """Remove an explicit page break from a paragraph."""
+    p_pr = paragraph._p.pPr
+    if p_pr is not None:
+        page_break_before = p_pr.find(qn("w:pageBreakBefore"))
+        if page_break_before is not None:
+            p_pr.remove(page_break_before)
+    for node in list(paragraph._p.iter()):
+        if node.tag == qn("w:lastRenderedPageBreak"):
+            node.getparent().remove(node)
+        elif node.tag == qn("w:br") and node.get(qn("w:type")) == "page":
+            node.getparent().remove(node)
+
+
 def _render_basics(target, eq, basics, answers):
-    for line_text in (eq.words[0].upper() + eq.words[1:], eq.letters):
-        p = _new_paragraph(target, space_after=4)
-        append_text(p, line_text, bold=True, size=12)
+    p = _new_paragraph(target, space_after=4)
+    append_text(p, eq.words[0].upper() + eq.words[1:] + "   ", bold=True, size=12)
+    append_text(p, eq.letters, bold=True, size=12)
     for i, (lead, blanks, answer) in enumerate(basics):
         p = _numbered(target, f"{i + 1})", lead)
-        if i == 2 and eq.triangle:
-            letters = [eq.symbol[k] for k in eq.triangle] if answers else None
-            p.add_run().add_picture(triangle_png(letters), height=Cm(2.4))
-            for run in p.runs[:-1]:   # lift the question text up beside the middle of the triangle
-                position = OxmlElement("w:position")
-                position.set(qn("w:val"), "30")
-                run._r.get_or_add_rPr().append(position)
-        else:
-            append_text(p, answer if answers else blanks, size=11)
+        append_text(p, answer if answers else blanks, size=11)
 
 
 def generate_documents(model, template_path):
-    """Return {'worksheet': BytesIO, 'answers': BytesIO, 'warnings': [...]}."""
+    """Return {'worksheet': BytesIO, 'answers': BytesIO, 'warnings': [...]} ."""
     eq = model["equation"]
     outputs, warnings = {}, []
     for mode in ("worksheet", "answers"):
         answers = mode == "answers"
         doc = Document(str(template_path))
         targets = {}
-        for p in _all_paragraphs(doc):
+        paragraphs = _all_paragraphs(doc)
+        for p in paragraphs:
             name = _placeholder_name(p)
             if name and name not in targets:
                 targets[name] = p
+
+        if "basics" in targets:
+            basics_index = next(i for i, p in enumerate(paragraphs) if p._p is targets["basics"]._p)
+            section_names = {spec["placeholder"] for spec in SECTIONS}
+            section_indices = [i for i, p in enumerate(paragraphs) if _placeholder_name(p) in section_names]
+            if section_indices:
+                first_section_index = min(section_indices)
+                if basics_index < first_section_index:
+                    for p in paragraphs[basics_index + 1:first_section_index + 1]:
+                        _remove_page_break(p)
 
         # --- title ---
         title = eq.title + (" – Answers" if answers else "")
@@ -555,7 +569,7 @@ def generate_documents(model, template_path):
             warnings.append("The template has no [[Basics]] placeholder.")
 
         # --- question sections, grouped by the paragraph they will be inserted in front of ---
-        hosts = {}  # host placeholder name -> [section specs]
+        hosts = {}
         for spec in SECTIONS:
             name = spec["placeholder"]
             if name in targets:
@@ -565,7 +579,7 @@ def generate_documents(model, template_path):
                 if spec["key"] == "unit_conversions" and fallback in targets:
                     nxt = targets[fallback]._p.getnext()
                     if nxt is not None and nxt.tag == qn("w:p") and not "".join(nxt.itertext()).strip():
-                        targets[name] = Paragraph(nxt, doc._body)   # the empty paragraph under [[Substitute]]
+                        targets[name] = Paragraph(nxt, doc._body)
                         host = name
                     else:
                         host = fallback
@@ -630,7 +644,7 @@ def main():
 
     st.markdown("Watch this video to learn how to get a free Gemini API key")
     video = "https://www.youtube.com/embed/Uyn-P2nRvDA"
-    if hasattr(st, "iframe"):   # newer Streamlit; components.iframe is deprecated
+    if hasattr(st, "iframe"):
         st.iframe(video, height=158, width=280)
     else:
         components.iframe(video, height=158, width=280, scrolling=False)
